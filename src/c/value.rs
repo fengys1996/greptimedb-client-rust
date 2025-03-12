@@ -1,4 +1,8 @@
+use std::slice::from_raw_parts;
+
 use greptime_proto::v1::{self, value::ValueData};
+
+use super::{error::RustResult, utils::convert_c_string};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -40,8 +44,10 @@ pub enum Value {
     TimestampValueNanosecondNull,
 }
 
-impl From<Value> for v1::Value {
-    fn from(val: Value) -> Self {
+impl TryFrom<Value> for v1::Value {
+    type Error = super::error::RustError;
+
+    fn try_from(val: Value) -> RustResult<Self> {
         let value_data = match val {
             Value::BoolValue(val) => Some(ValueData::BoolValue(val != 0)),
             Value::I8Value(val) => Some(ValueData::I8Value(val.into())),
@@ -54,8 +60,13 @@ impl From<Value> for v1::Value {
             Value::U64Value(val) => Some(ValueData::U64Value(val)),
             Value::F32Value(val) => Some(ValueData::F32Value(val)),
             Value::F64Value(val) => Some(ValueData::F64Value(val)),
-            Value::StringValue(_) => todo!(),
-            Value::BinaryValue(_, _) => todo!(),
+            Value::StringValue(val) => {
+                Some(ValueData::StringValue(unsafe { convert_c_string(val)? }))
+            }
+            Value::BinaryValue(val, len) => {
+                let binary = unsafe { from_raw_parts(val as *const u8, len) };
+                Some(ValueData::BinaryValue(binary.to_vec()))
+            }
             Value::TimestampValueSecond(val) => Some(ValueData::TimestampSecondValue(val)),
             Value::TimestampValueMillisecond(val) => {
                 Some(ValueData::TimestampMillisecondValue(val))
@@ -82,7 +93,7 @@ impl From<Value> for v1::Value {
             Value::TimestampValueMicrosecondNull => None,
             Value::TimestampValueNanosecondNull => None,
         };
-        v1::Value { value_data }
+        Ok(v1::Value { value_data })
     }
 }
 

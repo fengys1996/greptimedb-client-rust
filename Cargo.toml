@@ -24,8 +24,13 @@ tower = "0.4"
 derive_builder = "0.20"
 
 [build-dependencies]
+cbindgen = "0.28"
 tonic-build = "0.9"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 derive-new = "0.7"
+
+[lib]
+name = "greptimedb_ingester"
+crate-type = ["cdylib", "rlib"]

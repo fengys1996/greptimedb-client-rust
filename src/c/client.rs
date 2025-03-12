@@ -1,14 +1,14 @@
-use greptime_proto::v1::RowInsertRequests;
+use greptime_proto::v1::{RowInsertRequest, RowInsertRequests, Rows as ProtoRows};
 use snafu::ResultExt;
 
 use crate::{
-    c::runtime::runtime, ensure_not_null, ChannelConfig, ChannelManager, ClientBuilder,
-    ClientTlsOption, Database,
+    c::{rows::Inner, runtime::runtime},
+    ensure_not_null, ChannelConfig, ChannelManager, ClientBuilder, ClientTlsOption, Database,
 };
 
 use super::{
     error::{self, RustResult, StatusCode},
-    rows::Rows,
+    rows::RowBatch,
     utils::convert_c_string,
 };
 
@@ -26,19 +26,23 @@ pub struct ClientOptions {
 /// Create a new client for ingesting data into GreptimeDB.
 ///
 /// # Safety
+///
+/// The `client_ptr` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn client_new(
     opts: ClientOptions,
     client_ptr: *mut *mut Client,
 ) -> StatusCode {
-    if let Err(_e) = do_client_new(opts, client_ptr) {
+    if let Err(_e) = runtime().block_on(do_client_new(opts, client_ptr)) {
         StatusCode::Err
     } else {
         StatusCode::Success
     }
 }
 
-unsafe fn do_client_new(opts: ClientOptions, client_ptr: *mut *mut Client) -> RustResult<()> {
+// Why need run in tokio context?
+// Since the creation of the client needs in a tokio context.
+async unsafe fn do_client_new(opts: ClientOptions, client_ptr: *mut *mut Client) -> RustResult<()> {
     let ClientOptions {
         endpoint,
         db_name,
@@ -47,11 +51,10 @@ unsafe fn do_client_new(opts: ClientOptions, client_ptr: *mut *mut Client) -> Ru
 
     let greptimedb_endpoint = convert_c_string(endpoint)?;
     let greptimedb_dbname = convert_c_string(db_name)?;
-    let greptimedb_secure = secure;
 
     let builder = ClientBuilder::default().peers(vec![&greptimedb_endpoint]);
 
-    let grpc_client = if greptimedb_secure {
+    let grpc_client = if secure {
         let channel_config = ChannelConfig::default().client_tls_config(ClientTlsOption::default());
 
         let channel_manager =
@@ -67,31 +70,48 @@ unsafe fn do_client_new(opts: ClientOptions, client_ptr: *mut *mut Client) -> Ru
     Ok(())
 }
 
-/// Insert [`Rows`] into the GreptimeDB.
+/// Insert [`RowBatch`] into the GreptimeDB.
 ///
 /// # Safety
 ///
-/// Caller must ensure that `client_ptr` and `rows_ptr` are valid pointers.
-pub unsafe extern "C" fn client_insert_rows(
-    rows_ptr: *mut Rows,
+/// Caller must ensure that `client_ptr` and `row_batch_ptr` are valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn client_insert_row_batch(
+    row_batch_ptr: *mut RowBatch,
     client_ptr: *mut Client,
 ) -> StatusCode {
-    if let Err(_e) = do_client_insert_rows(rows_ptr, client_ptr) {
+    if let Err(_e) = do_client_insert_row_batch(row_batch_ptr, client_ptr) {
         StatusCode::Err
     } else {
         StatusCode::Success
     }
 }
 
-unsafe fn do_client_insert_rows(rows_ptr: *mut Rows, client_ptr: *mut Client) -> RustResult<()> {
+unsafe fn do_client_insert_row_batch(
+    row_batch_ptr: *mut RowBatch,
+    client_ptr: *mut Client,
+) -> RustResult<()> {
+    ensure_not_null!(row_batch_ptr, "row_batch_ptr");
     ensure_not_null!(client_ptr, "client_ptr");
-    ensure_not_null!(rows_ptr, "rows_ptr");
 
-    let _rows = unsafe { &*rows_ptr };
+    let row_batch = unsafe { &mut *row_batch_ptr };
     let client = unsafe { &mut *client_ptr };
 
-    // FIXME
-    let grpc_insert_req = RowInsertRequests { inserts: vec![] };
+    let Inner {
+        column_schemas,
+        rows,
+        table_name,
+    } = row_batch.inner.take().unwrap();
+
+    let row = RowInsertRequest {
+        table_name,
+        rows: Some(ProtoRows {
+            schema: column_schemas,
+            rows,
+        }),
+    };
+
+    let grpc_insert_req = RowInsertRequests { inserts: vec![row] };
     let r = runtime();
     let handle = r.spawn(async move {
         client

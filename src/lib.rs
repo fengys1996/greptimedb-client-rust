@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod api;
+pub mod c;
 pub mod channel_manager;
 mod client;
 mod database;

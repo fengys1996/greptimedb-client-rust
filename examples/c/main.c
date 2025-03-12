@@ -1,4 +1,4 @@
-#include "client.h"
+#include "greptimedb-ingester.h"
 #include <stdio.h>
 #include <unistd.h>
 

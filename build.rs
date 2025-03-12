@@ -6,7 +6,7 @@ fn main() {
     let header_file = Path::new("examples")
         .join("c")
         .join("include")
-        .join("client.h");
+        .join("greptimedb-ingester.h");
 
     cbindgen::generate(".")
         .expect("Unable to generate bindings")

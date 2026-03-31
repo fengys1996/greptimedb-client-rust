@@ -17,8 +17,9 @@
 //! This module provides a user-friendly API for bulk inserting data into `GreptimeDB`,
 //! abstracting away the low-level Arrow Flight details.
 
+mod session;
+
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,19 +37,20 @@ use arrow_array::builder::{
     UInt64Builder, UInt8Builder,
 };
 use arrow_array::{Array, RecordBatch};
-use arrow_flight::{FlightData, FlightDescriptor};
+use arrow_flight::FlightDescriptor;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use futures::channel::mpsc;
-use futures::{FutureExt, SinkExt, Stream, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 
 use crate::api::v1::ColumnDataType;
 use crate::client::Client;
 use crate::database::Database;
 use crate::flight::do_put::{DoPutMetadata, DoPutResponse};
-use crate::flight::{FlightEncoder, FlightMessage};
+use crate::flight::FlightMessage;
 use crate::table::{Column, DataTypeExtension, Row, TableSchema, Value};
 use crate::{error, Result};
 use snafu::{ensure, OptionExt, ResultExt};
+
+use self::session::BulkStreamSession;
 
 /// Default channel buffer size for streaming FlightData
 /// This controls how many FlightData messages can be buffered in the channel
@@ -56,10 +58,10 @@ use snafu::{ensure, OptionExt, ResultExt};
 /// at the cost of memory usage.
 ///
 /// Can be overridden by setting the GREPTIMEDB_CHANNEL_BUFFER_SIZE environment variable.
-const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 1024;
+pub(super) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 1024;
 
 /// Get configuration value from environment variable with fallback to default
-fn get_env_or_default<T>(env_var: &str, default: T) -> T
+pub(super) fn get_env_or_default<T>(env_var: &str, default: T) -> T
 where
     T: std::str::FromStr,
 {
@@ -175,13 +177,6 @@ pub struct BulkStreamWriter {
     completed_responses: HashMap<RequestId, (DoPutResponse, Instant)>,
 }
 
-struct BulkStreamSession {
-    sender: mpsc::Sender<FlightData>,
-    response_stream: Pin<Box<dyn Stream<Item = Result<DoPutResponse>>>>,
-    encoder: FlightEncoder,
-    schema_sent: bool,
-}
-
 impl BulkStreamWriter {
     /// Create a new bulk stream writer bound to a specific table schema
     pub async fn new(
@@ -209,7 +204,7 @@ impl BulkStreamWriter {
             .map(|(i, col)| (col.name.clone(), i))
             .collect();
 
-        let session = Self::create_session(database, &options).await?;
+        let session = BulkStreamSession::new(database, &options).await?;
         let parallelism = options.parallelism;
         let timeout = options.timeout;
 
@@ -767,29 +762,8 @@ impl BulkStreamWriter {
         self.next_request_id
     }
 
-    async fn create_session(
-        database: &Database,
-        options: &BulkWriteOptions,
-    ) -> Result<BulkStreamSession> {
-        let encoder = FlightEncoder::with_compression(options.compression);
-        let channel_buffer_size = get_env_or_default(
-            "GREPTIMEDB_CHANNEL_BUFFER_SIZE",
-            DEFAULT_CHANNEL_BUFFER_SIZE,
-        );
-        let (sender, receiver) = mpsc::channel::<FlightData>(channel_buffer_size);
-        let flight_stream = receiver.boxed();
-        let response_stream = database.do_put(flight_stream).await?;
-
-        Ok(BulkStreamSession {
-            sender,
-            response_stream,
-            encoder,
-            schema_sent: false,
-        })
-    }
-
     async fn rebuild_stream(&mut self) -> Result<()> {
-        self.session = Self::create_session(&self.database, &self.options).await?;
+        self.session = BulkStreamSession::new(&self.database, &self.options).await?;
         Ok(())
     }
 

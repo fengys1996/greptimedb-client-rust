@@ -168,9 +168,6 @@ pub struct BulkStreamWriter {
     next_request_id: RequestId,
     options: BulkWriteOptions,
     session: BulkStreamSession,
-    // Parallel processing fields
-    parallelism: usize,
-    timeout: Duration,
     // Track pending requests: request_id -> sent_time
     pending_requests: HashMap<RequestId, Instant>,
     // Cache completed responses that were processed but not yet retrieved
@@ -205,9 +202,6 @@ impl BulkStreamWriter {
             .collect();
 
         let session = BulkStreamSession::new(database, &options).await?;
-        let parallelism = options.parallelism;
-        let timeout = options.timeout;
-
         Ok(Self {
             database: database.clone(),
             table_schema: table_schema.clone(),
@@ -216,8 +210,6 @@ impl BulkStreamWriter {
             next_request_id: 0,
             options,
             session,
-            parallelism,
-            timeout,
             pending_requests: HashMap::new(),
             completed_responses: HashMap::new(),
         })
@@ -254,7 +246,7 @@ impl BulkStreamWriter {
             return Ok(response);
         }
 
-        let timeout_duration = self.timeout;
+        let timeout_duration = self.options.timeout;
         let start_time = Instant::now();
 
         loop {
@@ -265,7 +257,7 @@ impl BulkStreamWriter {
                     .recover_after_stream_failure(
                         format!(
                             "timed out waiting {:?} for request {}",
-                            self.timeout, target_request_id
+                            self.options.timeout, target_request_id
                         ),
                         None,
                     )
@@ -278,7 +270,7 @@ impl BulkStreamWriter {
                     .recover_after_stream_failure(
                         format!(
                             "timed out waiting {:?} for request {}",
-                            self.timeout, target_request_id
+                            self.options.timeout, target_request_id
                         ),
                         None,
                     )
@@ -329,7 +321,7 @@ impl BulkStreamWriter {
             responses.push(response);
         }
 
-        let timeout_duration = self.timeout;
+        let timeout_duration = self.options.timeout;
         let start_time = Instant::now();
 
         // Then wait for remaining responses
@@ -343,7 +335,7 @@ impl BulkStreamWriter {
                         .recover_after_stream_failure(
                             format!(
                                 "timed out waiting {:?} for pending requests",
-                                self.timeout
+                                self.options.timeout
                             ),
                             None,
                         )
@@ -517,8 +509,9 @@ impl BulkStreamWriter {
 
         if self.completed_responses.len() > RESPONSE_CACHE_CLEANUP_THRESHOLD {
             let now = Instant::now();
-            self.completed_responses
-                .retain(|_, (_, cached_time)| now.duration_since(*cached_time) <= self.timeout);
+            self.completed_responses.retain(|_, (_, cached_time)| {
+                now.duration_since(*cached_time) <= self.options.timeout
+            });
         }
     }
 
@@ -551,7 +544,8 @@ impl BulkStreamWriter {
                     .await;
             }
 
-            let response_result = timeout(self.timeout, self.session.response_stream.next()).await;
+            let response_result =
+                timeout(self.options.timeout, self.session.response_stream.next()).await;
             match response_result {
                 Ok(Some(response)) => {
                     if let Err(err) = response {
@@ -574,7 +568,10 @@ impl BulkStreamWriter {
                 Err(_) => {
                     return self
                         .recover_after_stream_failure(
-                            format!("timed out waiting {:?} for schema response", self.timeout),
+                            format!(
+                                "timed out waiting {:?} for schema response",
+                                self.options.timeout
+                            ),
                             None,
                         )
                         .await;
@@ -585,7 +582,7 @@ impl BulkStreamWriter {
         }
 
         // Wait for available slot if we've reached parallelism limit
-        while self.pending_requests.len() >= self.parallelism {
+        while self.pending_requests.len() >= self.options.parallelism {
             self.process_pending_responses().await?;
         }
 
@@ -615,7 +612,7 @@ impl BulkStreamWriter {
 
     /// Check for timed out requests
     fn check_timeouts(&self) -> Result<()> {
-        let timeout_duration = self.timeout;
+        let timeout_duration = self.options.timeout;
         let now = Instant::now();
 
         let timed_out_requests: Vec<RequestId> = self
@@ -633,7 +630,7 @@ impl BulkStreamWriter {
         if !timed_out_requests.is_empty() {
             return error::RequestTimeoutSnafu {
                 request_ids: timed_out_requests,
-                timeout: self.timeout,
+                timeout: self.options.timeout,
             }
             .fail();
         }
@@ -652,7 +649,8 @@ impl BulkStreamWriter {
 
         // Process responses to make room for new requests
         // First, wait for at least one response (blocking)
-        let response_result = timeout(self.timeout, self.session.response_stream.next()).await;
+        let response_result =
+            timeout(self.options.timeout, self.session.response_stream.next()).await;
         match response_result {
             Ok(Some(response)) => match response {
                 Ok(response) => self.receive_response_and_remove_pending(response),
@@ -678,7 +676,7 @@ impl BulkStreamWriter {
                     .recover_after_stream_failure(
                         format!(
                             "timed out waiting {:?} while processing pending responses",
-                            self.timeout
+                            self.options.timeout
                         ),
                         None,
                     )

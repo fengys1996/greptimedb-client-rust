@@ -73,6 +73,14 @@ where
 
 pub type RequestId = i64;
 
+enum StreamStepError {
+    Failed {
+        reason: String,
+        current_request_id: Option<RequestId>,
+    },
+    Other(crate::Error),
+}
+
 /// High-level bulk inserter for `GreptimeDB`
 #[derive(Clone, Debug)]
 pub struct BulkInserter {
@@ -541,7 +549,23 @@ impl BulkStreamWriter {
     /// Submit a record batch without waiting for response
     /// Returns the `request_id` for later tracking
     async fn submit_record_batch(&mut self, batch: RecordBatch) -> Result<RequestId> {
-        self.ensure_session().await?;
+        match self.submit_record_batch_impl(batch).await {
+            Ok(request_id) => Ok(request_id),
+            Err(StreamStepError::Failed {
+                reason,
+                current_request_id,
+            }) => self.handle_stream_failure(reason, current_request_id).await,
+            Err(StreamStepError::Other(err)) => Err(err),
+        }
+    }
+
+    async fn submit_record_batch_impl(
+        &mut self,
+        batch: RecordBatch,
+    ) -> std::result::Result<RequestId, StreamStepError> {
+        self.ensure_session()
+            .await
+            .map_err(StreamStepError::Other)?;
 
         // Send schema first if not already sent
         if !self
@@ -558,7 +582,8 @@ impl BulkStreamWriter {
                 .encode(FlightMessage::Schema(batch.schema()));
             let metadata = DoPutMetadata::new(0);
             schema_data.app_metadata = serde_json::to_vec(&metadata)
-                .context(error::SerializeMetadataSnafu)?
+                .context(error::SerializeMetadataSnafu)
+                .map_err(StreamStepError::Other)?
                 .into();
 
             schema_data.flight_descriptor = Some(FlightDescriptor {
@@ -570,19 +595,18 @@ impl BulkStreamWriter {
             let send_result = match self.session.as_mut() {
                 Some(session) => session.sender.send(schema_data).await,
                 None => {
-                    return self
-                        .handle_stream_failure(
-                            "failed to send schema to stream: stream session is unavailable"
-                                .to_string(),
-                            None,
-                        )
-                        .await;
+                    return Err(StreamStepError::Failed {
+                        reason: "failed to send schema to stream: stream session is unavailable"
+                            .to_string(),
+                        current_request_id: None,
+                    });
                 }
             };
             if let Err(err) = send_result {
-                return self
-                    .handle_stream_failure(format!("failed to send schema to stream: {err}"), None)
-                    .await;
+                return Err(StreamStepError::Failed {
+                    reason: format!("failed to send schema to stream: {err}"),
+                    current_request_id: None,
+                });
             }
 
             let response_result = match self.session.as_mut() {
@@ -590,43 +614,37 @@ impl BulkStreamWriter {
                     timeout(self.options.timeout, session.response_stream.next()).await
                 }
                 None => {
-                    return self
-                        .handle_stream_failure(
-                            "response stream ended while waiting for schema response".to_string(),
-                            None,
-                        )
-                        .await;
+                    return Err(StreamStepError::Failed {
+                        reason: "response stream ended while waiting for schema response"
+                            .to_string(),
+                        current_request_id: None,
+                    });
                 }
             };
             match response_result {
                 Ok(Some(response)) => {
                     if let Err(err) = response {
-                        return self
-                            .handle_stream_failure(
-                                format!("failed to read schema response: {err}"),
-                                None,
-                            )
-                            .await;
+                        return Err(StreamStepError::Failed {
+                            reason: format!("failed to read schema response: {err}"),
+                            current_request_id: None,
+                        });
                     }
                 }
                 Ok(None) => {
-                    return self
-                        .handle_stream_failure(
-                            "response stream ended while waiting for schema response".to_string(),
-                            None,
-                        )
-                        .await;
+                    return Err(StreamStepError::Failed {
+                        reason: "response stream ended while waiting for schema response"
+                            .to_string(),
+                        current_request_id: None,
+                    });
                 }
                 Err(_) => {
-                    return self
-                        .handle_stream_failure(
-                            format!(
-                                "timed out waiting {:?} for schema response",
-                                self.options.timeout
-                            ),
-                            None,
-                        )
-                        .await;
+                    return Err(StreamStepError::Failed {
+                        reason: format!(
+                            "timed out waiting {:?} for schema response",
+                            self.options.timeout
+                        ),
+                        current_request_id: None,
+                    });
                 }
             }
 
@@ -638,7 +656,9 @@ impl BulkStreamWriter {
 
         // Wait for available slot if we've reached parallelism limit
         while self.pending_requests.len() >= self.options.parallelism {
-            self.process_pending_responses().await?;
+            self.process_pending_responses()
+                .await
+                .map_err(StreamStepError::Other)?;
         }
 
         // Send the request
@@ -652,27 +672,26 @@ impl BulkStreamWriter {
             .encode(message);
         let metadata = DoPutMetadata::new(request_id);
         data.app_metadata = serde_json::to_vec(&metadata)
-            .context(error::SerializeMetadataSnafu)?
+            .context(error::SerializeMetadataSnafu)
+            .map_err(StreamStepError::Other)?
             .into();
 
         let send_result = match self.session.as_mut() {
             Some(session) => session.sender.send(data).await,
             None => {
-                return self
-                    .handle_stream_failure(
-                        format!("failed to send request {request_id} to stream: stream session is unavailable"),
-                        Some(request_id),
-                    )
-                    .await;
+                return Err(StreamStepError::Failed {
+                    reason: format!(
+                        "failed to send request {request_id} to stream: stream session is unavailable"
+                    ),
+                    current_request_id: Some(request_id),
+                });
             }
         };
         if let Err(err) = send_result {
-            return self
-                .handle_stream_failure(
-                    format!("failed to send request {request_id} to stream: {err}"),
-                    Some(request_id),
-                )
-                .await;
+            return Err(StreamStepError::Failed {
+                reason: format!("failed to send request {request_id} to stream: {err}"),
+                current_request_id: Some(request_id),
+            });
         }
 
         // Track this request but don't wait for response

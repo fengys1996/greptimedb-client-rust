@@ -141,6 +141,20 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Request outcome is unknown for request IDs {:?}; stream failure: {}; stream recovered: {}",
+        request_ids,
+        reason,
+        recovered
+    ))]
+    RequestsOutcomeUnknown {
+        request_ids: Vec<i64>,
+        reason: String,
+        recovered: bool,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
         "Schema mismatch: BulkStreamWriter expects schema {} but got {}",
         expected,
         actual

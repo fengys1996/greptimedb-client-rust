@@ -157,16 +157,15 @@ impl BulkWriteOptions {
 /// High-performance bulk stream writer that maintains a persistent connection
 /// Each writer is bound to a specific table with fixed schema
 pub struct BulkStreamWriter {
-    sender: mpsc::Sender<FlightData>,
-    response_stream: Pin<Box<dyn Stream<Item = Result<DoPutResponse>>>>,
+    database: Database,
     table_schema: TableSchema,
     // Cache the Arrow schema to avoid recreating it for each batch
     arrow_schema: Arc<Schema>,
     // Pre-computed field name to index mapping for O(1) lookup in RowBuilder
     field_map: HashMap<String, usize>,
     next_request_id: RequestId,
-    encoder: FlightEncoder,
-    schema_sent: bool,
+    options: BulkWriteOptions,
+    session: BulkStreamSession,
     // Parallel processing fields
     parallelism: usize,
     timeout: Duration,
@@ -176,6 +175,13 @@ pub struct BulkStreamWriter {
     completed_responses: HashMap<RequestId, (DoPutResponse, Instant)>,
 }
 
+struct BulkStreamSession {
+    sender: mpsc::Sender<FlightData>,
+    response_stream: Pin<Box<dyn Stream<Item = Result<DoPutResponse>>>>,
+    encoder: FlightEncoder,
+    schema_sent: bool,
+}
+
 impl BulkStreamWriter {
     /// Create a new bulk stream writer bound to a specific table schema
     pub async fn new(
@@ -183,9 +189,6 @@ impl BulkStreamWriter {
         table_schema: &TableSchema,
         options: BulkWriteOptions,
     ) -> Result<Self> {
-        // Create the encoder with compression settings
-        let encoder = FlightEncoder::with_compression(options.compression);
-
         // Convert table schema to Arrow schema
         let fields: Result<Vec<Field>> = table_schema
             .columns()
@@ -206,28 +209,20 @@ impl BulkStreamWriter {
             .map(|(i, col)| (col.name.clone(), i))
             .collect();
 
-        // Create a channel for streaming FlightData
-        let channel_buffer_size = get_env_or_default(
-            "GREPTIMEDB_CHANNEL_BUFFER_SIZE",
-            DEFAULT_CHANNEL_BUFFER_SIZE,
-        );
-        let (sender, receiver) = mpsc::channel::<FlightData>(channel_buffer_size);
-
-        // Convert receiver to a stream and start the do_put operation
-        let flight_stream = receiver.boxed();
-        let response_stream = database.do_put(flight_stream).await?;
+        let session = Self::create_session(database, &options).await?;
+        let parallelism = options.parallelism;
+        let timeout = options.timeout;
 
         Ok(Self {
-            sender,
-            response_stream,
+            database: database.clone(),
             table_schema: table_schema.clone(),
             arrow_schema,
             field_map,
             next_request_id: 0,
-            encoder,
-            schema_sent: false,
-            parallelism: options.parallelism,
-            timeout: options.timeout,
+            options,
+            session,
+            parallelism,
+            timeout,
             pending_requests: HashMap::new(),
             completed_responses: HashMap::new(),
         })
@@ -271,23 +266,41 @@ impl BulkStreamWriter {
             let remaining_timeout = timeout_duration.saturating_sub(start_time.elapsed());
             // Check timeout
             if remaining_timeout.is_zero() {
-                return error::RequestTimeoutSnafu {
-                    request_ids: vec![target_request_id],
-                    timeout: self.timeout,
-                }
-                .fail();
+                return self
+                    .recover_after_stream_failure(
+                        format!(
+                            "timed out waiting {:?} for request {}",
+                            self.timeout, target_request_id
+                        ),
+                        None,
+                    )
+                    .await;
             }
 
-            let next_result = timeout(remaining_timeout, self.response_stream.next()).await;
+            let next_result = timeout(remaining_timeout, self.session.response_stream.next()).await;
             let Ok(next_option) = next_result else {
-                return error::RequestTimeoutSnafu {
-                    request_ids: vec![target_request_id],
-                    timeout: self.timeout,
-                }
-                .fail();
+                return self
+                    .recover_after_stream_failure(
+                        format!(
+                            "timed out waiting {:?} for request {}",
+                            self.timeout, target_request_id
+                        ),
+                        None,
+                    )
+                    .await;
             };
             if let Some(response) = next_option {
-                let response = response?;
+                let response = match response {
+                    Ok(response) => response,
+                    Err(err) => {
+                        return self
+                            .recover_after_stream_failure(
+                                format!("failed to read response for request {target_request_id}: {err}"),
+                                None,
+                            )
+                            .await;
+                    }
+                };
                 let request_id = response.request_id();
                 self.pending_requests.remove(&request_id);
                 if request_id == target_request_id {
@@ -296,7 +309,14 @@ impl BulkStreamWriter {
                 self.completed_responses
                     .insert(request_id, (response, Instant::now()));
             } else {
-                return error::StreamEndedSnafu.fail();
+                return self
+                    .recover_after_stream_failure(
+                        format!(
+                            "response stream ended while waiting for request {target_request_id}"
+                        ),
+                        None,
+                    )
+                    .await;
             }
         }
     }
@@ -324,29 +344,67 @@ impl BulkStreamWriter {
 
             select! {
                 () = timeout_sleep => {
-                    let pending_ids: Vec<RequestId> = self.pending_requests.keys().copied().collect();
-                    return error::RequestTimeoutSnafu {
-                        request_ids: pending_ids,
-                        timeout: self.timeout,
-                    }
-                    .fail();
+                    return self
+                        .recover_after_stream_failure(
+                            format!(
+                                "timed out waiting {:?} for pending requests",
+                                self.timeout
+                            ),
+                            None,
+                        )
+                        .await;
                 }
-                next_option = self.response_stream.next() => {
+                next_option = self.session.response_stream.next() => {
                     match next_option {
                         Some(response) => {
                             // Process the first response
-                            self.handle_single_response(response?, &mut responses);
+                            let response = match response {
+                                Ok(response) => response,
+                                Err(err) => {
+                                    return self
+                                        .recover_after_stream_failure(
+                                            format!("failed to read pending response: {err}"),
+                                            None,
+                                        )
+                                        .await;
+                                }
+                            };
+                            self.handle_single_response(response, &mut responses);
 
                             // Drain immediately available responses to avoid false timeouts
                             loop {
-                                match self.response_stream.next().now_or_never() {
-                                    Some(Some(response)) => self.handle_single_response(response?, &mut responses),
-                                    Some(None) => return self.handle_stream_end(responses),
+                                match self.session.response_stream.next().now_or_never() {
+                                    Some(Some(response)) => match response {
+                                        Ok(response) => self.handle_single_response(response, &mut responses),
+                                        Err(err) => {
+                                            return self
+                                                .recover_after_stream_failure(
+                                                    format!("failed to read pending response: {err}"),
+                                                    None,
+                                                )
+                                                .await;
+                                        }
+                                    },
+                                    Some(None) => {
+                                        return self
+                                            .recover_after_stream_failure(
+                                                "response stream ended while draining pending responses".to_string(),
+                                                None,
+                                            )
+                                            .await;
+                                    }
                                     None => break, // No immediately available responses
                                 }
                             }
                         }
-                        None => return self.handle_stream_end(responses),
+                        None => {
+                            return self
+                                .recover_after_stream_failure(
+                                    "response stream ended while waiting for pending responses".to_string(),
+                                    None,
+                                )
+                                .await;
+                        }
                     }
                 }
             }
@@ -400,7 +458,7 @@ impl BulkStreamWriter {
         // Close the sender to signal the end of the stream
         // The result is ignored, as the stream being closed on the other
         // end is not a critical error. We still want to return the responses.
-        let _ = self.sender.close().await;
+        let _ = self.session.sender.close().await;
 
         Ok(all_responses)
     }
@@ -469,31 +527,15 @@ impl BulkStreamWriter {
         }
     }
 
-    /// Helper method to handle stream end cases
-    fn handle_stream_end(&self, responses: Vec<DoPutResponse>) -> Result<Vec<DoPutResponse>> {
-        ensure!(self.pending_requests.is_empty(), error::StreamEndedSnafu);
-        Ok(responses)
-    }
-
-    /// Helper method to handle stream end during processing
-    /// Returns Ok(()) if no pending requests, otherwise returns appropriate error
-    fn handle_stream_end_during_processing(&self) -> Result<()> {
-        if !self.pending_requests.is_empty() {
-            let pending_ids: Vec<RequestId> = self.pending_requests.keys().copied().collect();
-            return error::StreamEndedWithPendingRequestsSnafu {
-                request_ids: pending_ids,
-            }
-            .fail();
-        }
-        Ok(())
-    }
-
     /// Submit a record batch without waiting for response
     /// Returns the `request_id` for later tracking
     async fn submit_record_batch(&mut self, batch: RecordBatch) -> Result<RequestId> {
         // Send schema first if not already sent
-        if !self.schema_sent {
-            let mut schema_data = self.encoder.encode(FlightMessage::Schema(batch.schema()));
+        if !self.session.schema_sent {
+            let mut schema_data = self
+                .session
+                .encoder
+                .encode(FlightMessage::Schema(batch.schema()));
             let metadata = DoPutMetadata::new(0);
             schema_data.app_metadata = serde_json::to_vec(&metadata)
                 .context(error::SerializeMetadataSnafu)?
@@ -505,27 +547,46 @@ impl BulkStreamWriter {
                 ..Default::default()
             });
 
-            self.sender
-                .send(schema_data)
-                .await
-                .context(error::SendDataSnafu)?;
+            if let Err(err) = self.session.sender.send(schema_data).await {
+                return self
+                    .recover_after_stream_failure(
+                        format!("failed to send schema to stream: {err}"),
+                        None,
+                    )
+                    .await;
+            }
 
-            let response_result = timeout(self.timeout, self.response_stream.next()).await;
+            let response_result = timeout(self.timeout, self.session.response_stream.next()).await;
             match response_result {
                 Ok(Some(response)) => {
-                    let _schema_response = response?;
-                }
-                Ok(None) => return error::StreamEndedSnafu.fail(),
-                Err(_) => {
-                    return error::RequestTimeoutSnafu {
-                        request_ids: vec![],
-                        timeout: self.timeout,
+                    if let Err(err) = response {
+                        return self
+                            .recover_after_stream_failure(
+                                format!("failed to read schema response: {err}"),
+                                None,
+                            )
+                            .await;
                     }
-                    .fail();
+                }
+                Ok(None) => {
+                    return self
+                        .recover_after_stream_failure(
+                            "response stream ended while waiting for schema response".to_string(),
+                            None,
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    return self
+                        .recover_after_stream_failure(
+                            format!("timed out waiting {:?} for schema response", self.timeout),
+                            None,
+                        )
+                        .await;
                 }
             }
 
-            self.schema_sent = true;
+            self.session.schema_sent = true;
         }
 
         // Wait for available slot if we've reached parallelism limit
@@ -536,13 +597,20 @@ impl BulkStreamWriter {
         // Send the request
         let request_id = self.next_request_id();
         let message = FlightMessage::RecordBatch(batch);
-        let mut data = self.encoder.encode(message);
+        let mut data = self.session.encoder.encode(message);
         let metadata = DoPutMetadata::new(request_id);
         data.app_metadata = serde_json::to_vec(&metadata)
             .context(error::SerializeMetadataSnafu)?
             .into();
 
-        self.sender.send(data).await.context(error::SendDataSnafu)?;
+        if let Err(err) = self.session.sender.send(data).await {
+            return self
+                .recover_after_stream_failure(
+                    format!("failed to send request {request_id} to stream: {err}"),
+                    Some(request_id),
+                )
+                .await;
+        }
 
         // Track this request but don't wait for response
         self.pending_requests.insert(request_id, Instant::now());
@@ -581,31 +649,70 @@ impl BulkStreamWriter {
     /// Process pending responses to make room for new requests
     async fn process_pending_responses(&mut self) -> Result<()> {
         // First check for any timed out requests
-        self.check_timeouts()?;
+        if let Err(err) = self.check_timeouts() {
+            return self
+                .recover_after_stream_failure(format!("{err}"), None)
+                .await;
+        }
 
         // Process responses to make room for new requests
         // First, wait for at least one response (blocking)
-        let response_result = timeout(self.timeout, self.response_stream.next()).await;
+        let response_result = timeout(self.timeout, self.session.response_stream.next()).await;
         match response_result {
-            Ok(Some(response)) => self.receive_response_and_remove_pending(response?),
-            Ok(None) => return self.handle_stream_end_during_processing(),
-            Err(_) => {
-                let pending_ids: Vec<RequestId> = self.pending_requests.keys().copied().collect();
-                return error::RequestTimeoutSnafu {
-                    request_ids: pending_ids,
-                    timeout: self.timeout,
+            Ok(Some(response)) => match response {
+                Ok(response) => self.receive_response_and_remove_pending(response),
+                Err(err) => {
+                    return self
+                        .recover_after_stream_failure(
+                            format!("failed to process pending response: {err}"),
+                            None,
+                        )
+                        .await;
                 }
-                .fail();
+            },
+            Ok(None) => {
+                return self
+                    .recover_after_stream_failure(
+                        "response stream ended while processing pending responses".to_string(),
+                        None,
+                    )
+                    .await;
+            }
+            Err(_) => {
+                return self
+                    .recover_after_stream_failure(
+                        format!(
+                            "timed out waiting {:?} while processing pending responses",
+                            self.timeout
+                        ),
+                        None,
+                    )
+                    .await;
             }
         }
 
         // Then drain any additional responses quickly
         loop {
-            match self.response_stream.next().now_or_never() {
-                Some(Some(response)) => {
-                    self.receive_response_and_remove_pending(response?);
+            match self.session.response_stream.next().now_or_never() {
+                Some(Some(response)) => match response {
+                    Ok(response) => self.receive_response_and_remove_pending(response),
+                    Err(err) => {
+                        return self
+                            .recover_after_stream_failure(
+                                format!("failed to process pending response: {err}"),
+                                None,
+                            )
+                            .await;
+                    }
+                },
+                Some(None) => {
+                    return self
+                        .recover_after_stream_failure(
+                            "response stream ended while draining pending responses".to_string(),
+                            None,
+                        )
+                        .await;
                 }
-                Some(None) => return self.handle_stream_end_during_processing(),
                 None => break, // No immediately available responses
             }
         }
@@ -658,6 +765,62 @@ impl BulkStreamWriter {
             self.next_request_id = 1;
         }
         self.next_request_id
+    }
+
+    async fn create_session(
+        database: &Database,
+        options: &BulkWriteOptions,
+    ) -> Result<BulkStreamSession> {
+        let encoder = FlightEncoder::with_compression(options.compression);
+        let channel_buffer_size = get_env_or_default(
+            "GREPTIMEDB_CHANNEL_BUFFER_SIZE",
+            DEFAULT_CHANNEL_BUFFER_SIZE,
+        );
+        let (sender, receiver) = mpsc::channel::<FlightData>(channel_buffer_size);
+        let flight_stream = receiver.boxed();
+        let response_stream = database.do_put(flight_stream).await?;
+
+        Ok(BulkStreamSession {
+            sender,
+            response_stream,
+            encoder,
+            schema_sent: false,
+        })
+    }
+
+    async fn rebuild_stream(&mut self) -> Result<()> {
+        self.session = Self::create_session(&self.database, &self.options).await?;
+        Ok(())
+    }
+
+    async fn recover_after_stream_failure<T>(
+        &mut self,
+        reason: String,
+        current_request_id: Option<RequestId>,
+    ) -> Result<T> {
+        let mut unknown_request_ids: Vec<RequestId> =
+            self.pending_requests.keys().copied().collect();
+        if let Some(request_id) = current_request_id {
+            if !unknown_request_ids.contains(&request_id) {
+                unknown_request_ids.push(request_id);
+            }
+        }
+        unknown_request_ids.sort_unstable();
+        self.pending_requests.clear();
+
+        let recovered = self.rebuild_stream().await.is_ok();
+        let reason = if recovered {
+            reason
+        } else {
+            format!("{reason}; failed to rebuild stream")
+        };
+
+        error::RequestsOutcomeUnknownSnafu {
+            request_ids: unknown_request_ids,
+            reason,
+            recovered,
+        }
+        .fail()
     }
 }
 

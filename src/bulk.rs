@@ -167,7 +167,7 @@ pub struct BulkStreamWriter {
     field_map: HashMap<String, usize>,
     next_request_id: RequestId,
     options: BulkWriteOptions,
-    session: BulkStreamSession,
+    session: Option<BulkStreamSession>,
     // Track pending requests: request_id -> sent_time
     pending_requests: HashMap<RequestId, Instant>,
     // Cache completed responses that were processed but not yet retrieved
@@ -209,7 +209,7 @@ impl BulkStreamWriter {
             field_map,
             next_request_id: 0,
             options,
-            session,
+            session: Some(session),
             pending_requests: HashMap::new(),
             completed_responses: HashMap::new(),
         })
@@ -318,7 +318,12 @@ impl BulkStreamWriter {
                         )
                         .await;
                 }
-                next_option = self.session.response_stream.next() => {
+                next_option = async {
+                    match self.session.as_mut() {
+                        Some(session) => session.response_stream.next().await,
+                        None => None,
+                    }
+                } => {
                     match self
                         .map_response_result(
                             next_option,
@@ -398,7 +403,9 @@ impl BulkStreamWriter {
         // Close the sender to signal the end of the stream
         // The result is ignored, as the stream being closed on the other
         // end is not a critical error. We still want to return the responses.
-        let _ = self.session.sender.close().await;
+        if let Some(session) = &mut self.session {
+            let _ = session.sender.close().await;
+        }
 
         Ok(all_responses)
     }
@@ -471,10 +478,19 @@ impl BulkStreamWriter {
     /// Submit a record batch without waiting for response
     /// Returns the `request_id` for later tracking
     async fn submit_record_batch(&mut self, batch: RecordBatch) -> Result<RequestId> {
+        self.ensure_session().await?;
+
         // Send schema first if not already sent
-        if !self.session.schema_sent {
+        if !self
+            .session
+            .as_ref()
+            .expect("session initialized")
+            .schema_sent
+        {
             let mut schema_data = self
                 .session
+                .as_mut()
+                .expect("session initialized")
                 .encoder
                 .encode(FlightMessage::Schema(batch.schema()));
             let metadata = DoPutMetadata::new(0);
@@ -502,7 +518,10 @@ impl BulkStreamWriter {
                 )
                 .await?;
 
-            self.session.schema_sent = true;
+            self.session
+                .as_mut()
+                .expect("session initialized")
+                .schema_sent = true;
         }
 
         // Wait for available slot if we've reached parallelism limit
@@ -513,7 +532,12 @@ impl BulkStreamWriter {
         // Send the request
         let request_id = self.next_request_id();
         let message = FlightMessage::RecordBatch(batch);
-        let mut data = self.session.encoder.encode(message);
+        let mut data = self
+            .session
+            .as_mut()
+            .expect("session initialized")
+            .encoder
+            .encode(message);
         let metadata = DoPutMetadata::new(request_id);
         data.app_metadata = serde_json::to_vec(&metadata)
             .context(error::SerializeMetadataSnafu)?
@@ -646,8 +670,10 @@ impl BulkStreamWriter {
         self.next_request_id
     }
 
-    async fn rebuild_stream(&mut self) -> Result<()> {
-        self.session = BulkStreamSession::new(&self.database, &self.options).await?;
+    async fn ensure_session(&mut self) -> Result<()> {
+        if self.session.is_none() {
+            self.session = Some(BulkStreamSession::new(&self.database, &self.options).await?);
+        }
         Ok(())
     }
 
@@ -662,7 +688,19 @@ impl BulkStreamWriter {
         context: impl Into<String>,
         current_request_id: Option<RequestId>,
     ) -> Result<()> {
-        if let Err(err) = self.session.sender.send(data).await {
+        let send_result = match self.session.as_mut() {
+            Some(session) => session.sender.send(data).await,
+            None => {
+                return self
+                    .handle_stream_failure(
+                        format!("{}: stream session is unavailable", context.into()),
+                        current_request_id,
+                    )
+                    .await;
+            }
+        };
+
+        if let Err(err) = send_result {
             return self
                 .handle_stream_failure(format!("{}: {err}", context.into()), current_request_id)
                 .await;
@@ -677,7 +715,14 @@ impl BulkStreamWriter {
         read_error_context: &str,
         end_reason: &str,
     ) -> Result<DoPutResponse> {
-        let next_result = timeout(duration, self.session.response_stream.next()).await;
+        let next_result = match self.session.as_mut() {
+            Some(session) => timeout(duration, session.response_stream.next()).await,
+            None => {
+                return self
+                    .handle_stream_failure(end_reason.to_string(), None)
+                    .await
+            }
+        };
         let Ok(next_option) = next_result else {
             return self.handle_stream_failure(timeout_reason, None).await;
         };
@@ -690,7 +735,12 @@ impl BulkStreamWriter {
         read_error_context: &str,
         end_reason: &str,
     ) -> Result<Option<DoPutResponse>> {
-        match self.session.response_stream.next().now_or_never() {
+        let next_option = match self.session.as_mut() {
+            Some(session) => session.response_stream.next().now_or_never(),
+            None => return Ok(None),
+        };
+
+        match next_option {
             Some(next_option) => self
                 .map_response_result(next_option, read_error_context, end_reason)
                 .await
@@ -741,18 +791,12 @@ impl BulkStreamWriter {
         }
         unknown_request_ids.sort_unstable();
         self.pending_requests.clear();
-
-        let recovered = self.rebuild_stream().await.is_ok();
-        let reason = if recovered {
-            reason
-        } else {
-            format!("{reason}; failed to rebuild stream")
-        };
+        self.session = None;
 
         error::RequestsOutcomeUnknownSnafu {
             request_ids: unknown_request_ids,
             reason,
-            recovered,
+            recovered: false,
         }
         .fail()
     }

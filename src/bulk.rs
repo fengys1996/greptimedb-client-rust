@@ -254,7 +254,7 @@ impl BulkStreamWriter {
             // Check timeout
             if remaining_timeout.is_zero() {
                 return self
-                    .recover_after_stream_failure(
+                    .handle_stream_failure(
                         format!(
                             "timed out waiting {:?} for request {}",
                             self.options.timeout, target_request_id
@@ -264,47 +264,24 @@ impl BulkStreamWriter {
                     .await;
             }
 
-            let next_result = timeout(remaining_timeout, self.session.response_stream.next()).await;
-            let Ok(next_option) = next_result else {
-                return self
-                    .recover_after_stream_failure(
-                        format!(
-                            "timed out waiting {:?} for request {}",
-                            self.options.timeout, target_request_id
-                        ),
-                        None,
-                    )
-                    .await;
-            };
-            if let Some(response) = next_option {
-                let response = match response {
-                    Ok(response) => response,
-                    Err(err) => {
-                        return self
-                            .recover_after_stream_failure(
-                                format!("failed to read response for request {target_request_id}: {err}"),
-                                None,
-                            )
-                            .await;
-                    }
-                };
-                let request_id = response.request_id();
-                self.pending_requests.remove(&request_id);
-                if request_id == target_request_id {
-                    return Ok(response);
-                }
-                self.completed_responses
-                    .insert(request_id, (response, Instant::now()));
-            } else {
-                return self
-                    .recover_after_stream_failure(
-                        format!(
-                            "response stream ended while waiting for request {target_request_id}"
-                        ),
-                        None,
-                    )
-                    .await;
+            let response = self
+                .next_response_with_timeout(
+                    remaining_timeout,
+                    format!(
+                        "timed out waiting {:?} for request {}",
+                        self.options.timeout, target_request_id
+                    ),
+                    &format!("failed to read response for request {target_request_id}"),
+                    &format!("response stream ended while waiting for request {target_request_id}"),
+                )
+                .await?;
+            let request_id = response.request_id();
+            self.pending_requests.remove(&request_id);
+            if request_id == target_request_id {
+                return Ok(response);
             }
+            self.completed_responses
+                .insert(request_id, (response, Instant::now()));
         }
     }
 
@@ -332,7 +309,7 @@ impl BulkStreamWriter {
             select! {
                 () = timeout_sleep => {
                     return self
-                        .recover_after_stream_failure(
+                        .handle_stream_failure(
                             format!(
                                 "timed out waiting {:?} for pending requests",
                                 self.options.timeout
@@ -342,56 +319,32 @@ impl BulkStreamWriter {
                         .await;
                 }
                 next_option = self.session.response_stream.next() => {
-                    match next_option {
-                        Some(response) => {
-                            // Process the first response
-                            let response = match response {
-                                Ok(response) => response,
-                                Err(err) => {
-                                    return self
-                                        .recover_after_stream_failure(
-                                            format!("failed to read pending response: {err}"),
-                                            None,
-                                        )
-                                        .await;
-                                }
-                            };
+                    match self
+                        .map_response_result(
+                            next_option,
+                            "failed to read pending response",
+                            "response stream ended while waiting for pending responses",
+                        )
+                        .await
+                    {
+                        Ok(response) => {
                             self.handle_single_response(response, &mut responses);
 
                             // Drain immediately available responses to avoid false timeouts
                             loop {
-                                match self.session.response_stream.next().now_or_never() {
-                                    Some(Some(response)) => match response {
-                                        Ok(response) => self.handle_single_response(response, &mut responses),
-                                        Err(err) => {
-                                            return self
-                                                .recover_after_stream_failure(
-                                                    format!("failed to read pending response: {err}"),
-                                                    None,
-                                                )
-                                                .await;
-                                        }
-                                    },
-                                    Some(None) => {
-                                        return self
-                                            .recover_after_stream_failure(
-                                                "response stream ended while draining pending responses".to_string(),
-                                                None,
-                                            )
-                                            .await;
-                                    }
+                                match self
+                                    .poll_ready_response(
+                                        "failed to read pending response",
+                                        "response stream ended while draining pending responses",
+                                    )
+                                    .await?
+                                {
+                                    Some(response) => self.handle_single_response(response, &mut responses),
                                     None => break, // No immediately available responses
                                 }
                             }
                         }
-                        None => {
-                            return self
-                                .recover_after_stream_failure(
-                                    "response stream ended while waiting for pending responses".to_string(),
-                                    None,
-                                )
-                                .await;
-                        }
+                        Err(err) => return Err(err),
                     }
                 }
             }
@@ -535,48 +488,19 @@ impl BulkStreamWriter {
                 ..Default::default()
             });
 
-            if let Err(err) = self.session.sender.send(schema_data).await {
-                return self
-                    .recover_after_stream_failure(
-                        format!("failed to send schema to stream: {err}"),
-                        None,
-                    )
-                    .await;
-            }
-
-            let response_result =
-                timeout(self.options.timeout, self.session.response_stream.next()).await;
-            match response_result {
-                Ok(Some(response)) => {
-                    if let Err(err) = response {
-                        return self
-                            .recover_after_stream_failure(
-                                format!("failed to read schema response: {err}"),
-                                None,
-                            )
-                            .await;
-                    }
-                }
-                Ok(None) => {
-                    return self
-                        .recover_after_stream_failure(
-                            "response stream ended while waiting for schema response".to_string(),
-                            None,
-                        )
-                        .await;
-                }
-                Err(_) => {
-                    return self
-                        .recover_after_stream_failure(
-                            format!(
-                                "timed out waiting {:?} for schema response",
-                                self.options.timeout
-                            ),
-                            None,
-                        )
-                        .await;
-                }
-            }
+            self.send_flight_data(schema_data, "failed to send schema to stream", None)
+                .await?;
+            let _ = self
+                .next_response_with_timeout(
+                    self.options.timeout,
+                    format!(
+                        "timed out waiting {:?} for schema response",
+                        self.options.timeout
+                    ),
+                    "failed to read schema response",
+                    "response stream ended while waiting for schema response",
+                )
+                .await?;
 
             self.session.schema_sent = true;
         }
@@ -595,14 +519,12 @@ impl BulkStreamWriter {
             .context(error::SerializeMetadataSnafu)?
             .into();
 
-        if let Err(err) = self.session.sender.send(data).await {
-            return self
-                .recover_after_stream_failure(
-                    format!("failed to send request {request_id} to stream: {err}"),
-                    Some(request_id),
-                )
-                .await;
-        }
+        self.send_flight_data(
+            data,
+            format!("failed to send request {request_id} to stream"),
+            Some(request_id),
+        )
+        .await?;
 
         // Track this request but don't wait for response
         self.pending_requests.insert(request_id, Instant::now());
@@ -642,70 +564,34 @@ impl BulkStreamWriter {
     async fn process_pending_responses(&mut self) -> Result<()> {
         // First check for any timed out requests
         if let Err(err) = self.check_timeouts() {
-            return self
-                .recover_after_stream_failure(format!("{err}"), None)
-                .await;
+            return self.handle_stream_failure(format!("{err}"), None).await;
         }
 
         // Process responses to make room for new requests
         // First, wait for at least one response (blocking)
-        let response_result =
-            timeout(self.options.timeout, self.session.response_stream.next()).await;
-        match response_result {
-            Ok(Some(response)) => match response {
-                Ok(response) => self.receive_response_and_remove_pending(response),
-                Err(err) => {
-                    return self
-                        .recover_after_stream_failure(
-                            format!("failed to process pending response: {err}"),
-                            None,
-                        )
-                        .await;
-                }
-            },
-            Ok(None) => {
-                return self
-                    .recover_after_stream_failure(
-                        "response stream ended while processing pending responses".to_string(),
-                        None,
-                    )
-                    .await;
-            }
-            Err(_) => {
-                return self
-                    .recover_after_stream_failure(
-                        format!(
-                            "timed out waiting {:?} while processing pending responses",
-                            self.options.timeout
-                        ),
-                        None,
-                    )
-                    .await;
-            }
-        }
+        let response = self
+            .next_response_with_timeout(
+                self.options.timeout,
+                format!(
+                    "timed out waiting {:?} while processing pending responses",
+                    self.options.timeout
+                ),
+                "failed to process pending response",
+                "response stream ended while processing pending responses",
+            )
+            .await?;
+        self.receive_response_and_remove_pending(response);
 
         // Then drain any additional responses quickly
         loop {
-            match self.session.response_stream.next().now_or_never() {
-                Some(Some(response)) => match response {
-                    Ok(response) => self.receive_response_and_remove_pending(response),
-                    Err(err) => {
-                        return self
-                            .recover_after_stream_failure(
-                                format!("failed to process pending response: {err}"),
-                                None,
-                            )
-                            .await;
-                    }
-                },
-                Some(None) => {
-                    return self
-                        .recover_after_stream_failure(
-                            "response stream ended while draining pending responses".to_string(),
-                            None,
-                        )
-                        .await;
-                }
+            match self
+                .poll_ready_response(
+                    "failed to process pending response",
+                    "response stream ended while draining pending responses",
+                )
+                .await?
+            {
+                Some(response) => self.receive_response_and_remove_pending(response),
                 None => break, // No immediately available responses
             }
         }
@@ -765,11 +651,87 @@ impl BulkStreamWriter {
         Ok(())
     }
 
-    async fn recover_after_stream_failure<T>(
+    fn should_rebuild_session(&self, _reason: &str) -> bool {
+        // TODO(fys): classify stream errors and only rebuild for reconnectable failures.
+        true
+    }
+
+    async fn send_flight_data(
+        &mut self,
+        data: arrow_flight::FlightData,
+        context: impl Into<String>,
+        current_request_id: Option<RequestId>,
+    ) -> Result<()> {
+        if let Err(err) = self.session.sender.send(data).await {
+            return self
+                .handle_stream_failure(format!("{}: {err}", context.into()), current_request_id)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn next_response_with_timeout(
+        &mut self,
+        duration: Duration,
+        timeout_reason: String,
+        read_error_context: &str,
+        end_reason: &str,
+    ) -> Result<DoPutResponse> {
+        let next_result = timeout(duration, self.session.response_stream.next()).await;
+        let Ok(next_option) = next_result else {
+            return self.handle_stream_failure(timeout_reason, None).await;
+        };
+        self.map_response_result(next_option, read_error_context, end_reason)
+            .await
+    }
+
+    async fn poll_ready_response(
+        &mut self,
+        read_error_context: &str,
+        end_reason: &str,
+    ) -> Result<Option<DoPutResponse>> {
+        match self.session.response_stream.next().now_or_never() {
+            Some(next_option) => self
+                .map_response_result(next_option, read_error_context, end_reason)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn map_response_result(
+        &mut self,
+        next_option: Option<Result<DoPutResponse>>,
+        read_error_context: &str,
+        end_reason: &str,
+    ) -> Result<DoPutResponse> {
+        match next_option {
+            Some(Ok(response)) => Ok(response),
+            Some(Err(err)) => {
+                self.handle_stream_failure(format!("{read_error_context}: {err}"), None)
+                    .await
+            }
+            None => {
+                self.handle_stream_failure(end_reason.to_string(), None)
+                    .await
+            }
+        }
+    }
+
+    async fn handle_stream_failure<T>(
         &mut self,
         reason: String,
         current_request_id: Option<RequestId>,
     ) -> Result<T> {
+        if !self.should_rebuild_session(&reason) {
+            return error::RequestsOutcomeUnknownSnafu {
+                request_ids: vec![],
+                reason,
+                recovered: false,
+            }
+            .fail();
+        }
+
         let mut unknown_request_ids: Vec<RequestId> =
             self.pending_requests.keys().copied().collect();
         if let Some(request_id) = current_request_id {
